@@ -1,6 +1,0 @@
-[submodule "vulkandMod"]
-	path = vulkandMod
-	url = https://github.com/Itiro-P/VulkanMod
-[submodule "pdx_unlimiter"]
-	path = pdx_unlimiter
-	url = https://github.com/Itiro-P/pdx_unlimiter
