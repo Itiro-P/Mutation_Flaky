@@ -12,14 +12,24 @@ from typing import Dict, List
 from datetime import datetime
 import xml.etree.ElementTree as ET
 from shutil import copy2, copytree
-import getpass
+import time
+
 uid = os.getuid() if hasattr(os, "getuid") else 1000
 gid = os.getgid() if hasattr(os, "getgid") else 1000
 
 PIT_VERSION = "1.14.2"
 PIT_JUNIT5_PLUGIN_VERSION = "1.2.1"
 DOCKER_IMG = "maven:3.9-eclipse-temurin-21"
-MUTATORS = None
+MUTATORS = [
+    "MATH", 
+    "CONDITIONALS_BOUNDARY", 
+    "EXPERIMENTAL_ARGUMENT_PROPAGATION", 
+    "EXPERIMENTAL_NAKED_RECEIVER", 
+    "VOID_METHOD_CALLS", 
+    "NON_VOID_METHOD_CALLS", 
+    "INCREMENTS", 
+    "NEGATE_CONDITIONALS"
+]
 PIT_CONFIG = None
 DEBUG = True
 
@@ -267,12 +277,14 @@ class CommitAnalyzer:
             except Exception:
                 host_uid = host_gid = 1000
 
-            mvn_pre = 'mvn -B -Drat.skip=true -DskipITs=true test-compile'
+            mvn_pre = 'mvn -B -q -Drat.skip=true -DskipITs=true test-compile'
             mvn_pitest = (
-                'mvn -B org.pitest:pitest-maven:%s:mutationCoverage '
-                '-DtargetClasses="%s" -DtargetTests="%s" -DreportsDirectory="%s" '
-                '-DfailWhenNoMutations=false -DskipTests=false'
-            ) % (PIT_VERSION, classes_str, tests_str, "/reports")
+                f'mvn -B org.pitest:pitest-maven:{PIT_VERSION}:mutationCoverage '
+                f'-DtargetClasses="{classes_str}" -DtargetTests="{tests_str}" '
+                f'-DreportsDirectory="/reports" '
+                f'{f"-Dmutators={",".join(MUTATORS)} " if len(MUTATORS) > 0 else ""}'
+                f'-DfailWhenNoMutations=false -DskipTests=false'
+            )
 
             docker_cmd = (
                 'docker run --rm '
@@ -322,6 +334,7 @@ class CommitAnalyzer:
             print(f"  [{r['index']:02d}] {r['commit']}")
             print(f"       {r['info']['message']}")
             print(f"       Altered classes: {classes_count}")
+            print(f"       Time elapsed: {r['time_elapsed']}")
 
         print("\nPITest reports:")
         if results:
@@ -333,6 +346,11 @@ class CommitAnalyzer:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
         print(f"\nIndex saved in: {index_file}")
+
+    def _tempo(self, intervalo):
+        horas, resto = divmod(intervalo, 3600)
+        minutos, segundos = divmod(resto, 60)
+        return f"{int(horas):02d}:{int(minutos):02d}:{segundos:05.2f}"
 
     def analyze(self):
         print(f"\n{'='*70}")
@@ -420,7 +438,9 @@ class CommitAnalyzer:
             report_dir = self.reportsDir / f"{idx:02d}-{commit}"
             report_dir.mkdir(parents=True, exist_ok=True)
             
+            mutStart = time.perf_counter()
             success = self._runPitInDocker(commit, target_classes, report_dir)
+            mutEnd = time.perf_counter()
             
             if success:
                 print("PITest completed")
@@ -430,6 +450,7 @@ class CommitAnalyzer:
                     "commit": commit,
                     "info": info,
                     "changes": changes,
+                    "time_elapsed": self._tempo(mutEnd - mutStart),
                     "report_dir": str(report_dir)
                 }
                 results.append(result)
