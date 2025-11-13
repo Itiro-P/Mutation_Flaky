@@ -5,28 +5,33 @@ import subprocess
 import json
 import re
 import click
+import shutil
+import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
+from datetime import datetime
+import xml.etree.ElementTree as ET
+from shutil import copy2, copytree
+import getpass
+uid = os.getuid() if hasattr(os, "getuid") else 1000
+gid = os.getgid() if hasattr(os, "getgid") else 1000
 
+PIT_VERSION = "1.14.2"
+PIT_JUNIT5_PLUGIN_VERSION = "1.2.1"
+DOCKER_IMG = "maven:3.9-eclipse-temurin-21"
+MUTATORS = None
+PIT_CONFIG = None
 DEBUG = True
 
 class CommitAnalyzer:
     """
-        Class that analyses commits incrementally using mutation testing in:
-        - Altered lines.
-            - Methods that also *calls* these lines (**callers**);
-            - Methods *called* by these lines (**callees**).
-        
-        The mutation score calculated in each commit is a measure to ensure software quality.
+        Analyzes commits incrementally using mutation testing in Docker containers.
     """
 
     def __init__(self, projectDir, count):
         self.projectDir = Path(projectDir).resolve()
         self.repoName = self._getRepositoryName()
         self.timestamp = self._getTimestamp()
-        
-        # Create organized directory structure
-        # diff_analysis/common-collections/2025-11-12_21-30-45/
         self.reportsDir = Path.cwd() / "diff_analysis" / self.repoName / self.timestamp
         self.mcParserPath = Path(Path.cwd() / "MCParser" / "target" / "MCParser-1.0.jar").resolve()
         self.count = count
@@ -43,103 +48,78 @@ class CommitAnalyzer:
         self.reportsDir.mkdir(parents=True, exist_ok=True)
 
     def _getRepositoryName(self):
-        """
-        Extract repository name from project path.
-        Example: /home/user/projects/common-collections -> common-collections
-        """
         return self.projectDir.name
 
     def _getTimestamp(self):
-        """
-        Get current timestamp in format YYYY-MM-DD_HH-MM-SS
-        """
-        from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     def _runCommand(self, cmd: str, cwd: Path = None, live_output: bool = False, timeout: int = 600):
-            """
-                Run a command using the shell.
-                You can also force `stdout` to show using `live_output = True`
-            """
-            cwd = cwd or self.projectDir
+        cwd = cwd or self.projectDir
+        try:
+            proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except Exception as e:
+            return 1, "", str(e)
+
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+
+        try:
+            if live_output:
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+                while True:
+                    line = proc.stdout.readline()
+                    if line:
+                        print(line, end="", flush=True)
+                        stdout_chunks.append(line)
+                    else:
+                        if proc.poll() is not None:
+                            break
+                rest = proc.stdout.read()
+                if rest:
+                    stdout_chunks.append(rest)
+                stderr_chunks.append(proc.stderr.read() or "")
+            else:
+                out, err = proc.communicate(timeout=timeout)
+                stdout_chunks.append(out or "")
+                stderr_chunks.append(err or "")
+
+            ret = proc.wait(timeout=1)
+            return ret, "".join(stdout_chunks), "".join(stderr_chunks)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return 124, "".join(stdout_chunks), "Timeout"
+        except Exception as e:
             try:
-                proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-            except Exception as e:
-                return 1, "", str(e)
-
-            stdout_chunks: List[str] = []
-            stderr_chunks: List[str] = []
-
-            try:
-                if live_output:
-                    # stream stdout while collecting stderr separately
-                    assert proc.stdout is not None
-                    assert proc.stderr is not None
-                    while True:
-                        line = proc.stdout.readline()
-                        if line:
-                            print(line, end="", flush=True)
-                            stdout_chunks.append(line)
-                        else:
-                            # check if finished
-                            if proc.poll() is not None:
-                                break
-                    # read any remaining stdout
-                    rest = proc.stdout.read()
-                    if rest:
-                        stdout_chunks.append(rest)
-                    # read stderr fully
-                    stderr_chunks.append(proc.stderr.read() or "")
-                else:
-                    out, err = proc.communicate(timeout=timeout)
-                    stdout_chunks.append(out or "")
-                    stderr_chunks.append(err or "")
-
-                ret = proc.wait(timeout=1)
-                return ret, "".join(stdout_chunks), "".join(stderr_chunks)
-            except subprocess.TimeoutExpired:
                 proc.kill()
-                return 124, "".join(stdout_chunks), "Timeout"
-            except Exception as e:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return 1, "".join(stdout_chunks), str(e)
+            except Exception:
+                pass
+            return 1, "".join(stdout_chunks), str(e)
 
     def _getCurrentBranch(self):
-        """
-            Retrieves the current branch. Used internally.
-        """
         code, stdout, stderr = self._runCommand("git rev-parse --abbrev-ref HEAD")
         return stdout.strip() if code == 0 else "main"
 
-    def _getCommitDiff(self, commit):
-        """
-            Retrieves the diff's commit. Used internally.
-        """
-        code, stdout, stderr = self._runCommand(f"git show {commit} --unified=0")
-        return stdout if code == 0 else ""
+    def _getCommitInfo(self, commit):
+        msg_code, msg, _ = self._runCommand(f"git log --format=%B -n 1 {commit}")
+        date_code, date, _ = self._runCommand(f"git log --format=%aI -n 1 {commit}")
+        msg = msg.strip().split('\n')[0] if msg_code == 0 else "N/A"
+        date = date.strip() if date_code == 0 else "N/A"
+        return {"message": msg, "date": date}
 
     def _getChangedLines(self, commit) -> Dict[str, List[int]]:
-        """
-            Extract altered lines on a commit using diffs.\n
-            Uses git show --unified=0 to get a hunk with no context, parses @@ -a,b +c,d @@
-        """
         changed: Dict[str, List[int]] = {}
         code, diff_text, _ = self._runCommand(f"git show {commit} --unified=0")
         if code != 0 or not diff_text:
             return changed
 
         cur_file = None
-        # pattern for file marker: diff --git a/path b/path
         file_re = re.compile(r'^diff --git a/(.+?) b/(.+)$')
         hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
 
         for line in diff_text.splitlines():
             mfile = file_re.match(line)
             if mfile:
-                # take new path
                 cur_file = mfile.group(2).strip()
                 continue
 
@@ -157,41 +137,29 @@ class CommitAnalyzer:
                     lst.append(i)
                 continue
 
-        # dedupe and sort
         for k in list(changed.keys()):
             changed[k] = sorted(set(changed[k]))
         return changed
 
     def _mapLinesToMethods(self, file_path: str, lines: List[int], cwd: Path = None):
-        """
-        Calls MCParser to retrieve changed methods as well as callers and callees.
-        Compresses consecutive line numbers into ranges (e.g., 20-25).
-        """
         if not lines:
             return {}
 
         sorted_lines = sorted(set(lines))
-        
-        # Compress consecutive lines into ranges
         compressed = []
         i = 0
         while i < len(sorted_lines):
             start = sorted_lines[i]
             end = start
-            
-            # Find consecutive sequence
             while i + 1 < len(sorted_lines) and sorted_lines[i + 1] == sorted_lines[i] + 1:
                 i += 1
                 end = sorted_lines[i]
-            
-            # Add range or single number
             if start == end:
                 compressed.append(str(start))
             else:
                 compressed.append(f"{start}-{end}")
-            
             i += 1
-        
+
         target_file = (cwd / file_path) if cwd and not Path(file_path).is_absolute() else Path(file_path)
         if not target_file.exists():
             alt = self.projectDir / file_path
@@ -201,11 +169,11 @@ class CommitAnalyzer:
                 print(f"File not found: {file_path}")
                 return {}
 
-        # Build command with multiple -l arguments (preserving ranges)
         lines_str = " ".join(f"-l {ln}" for ln in compressed)
         cmd = f"java -jar \"{self.mcParserPath}\" -f \"{target_file}\" {lines_str}"
         
-        if DEBUG: print(f"[CMD] Lines compressed to: {compressed}")
+        if DEBUG:
+            print(f"[CMD] Lines compressed to: {compressed}")
         
         code, out, err = self._runCommand(cmd, cwd=cwd, live_output=DEBUG)
         
@@ -220,69 +188,126 @@ class CommitAnalyzer:
             print(f"Failed to parse MCParser JSON: {e}")
             return {}
 
-    def _compileProject(self, cwd=None, live_output=DEBUG):
-        """
-        Compiles project in the current working directory (worktree)
-        """
-        print(f"    Compiling... (cwd={cwd or self.projectDir})")
-        
-        # First time: clean compile
-        # After: only recompile changed files
-        cmd = "mvn compile test-compile -DskipTests=true"
-        
-        code, out, err = self._runCommand(cmd, cwd=cwd, live_output=live_output)
-        if code != 0:
-            print("Error when compiling:")
-            if out:
-                print(out[-500:])
-            if err:
-                print(err[-500:])
-            # Retry with clean if failed
-            print("Retrying with clean...")
-            cmd = "mvn clean compile test-compile -DskipTests=true"
-            code, out, err = self._runCommand(cmd, cwd=cwd, live_output=live_output)
-            return code == 0
-        
-        return code == 0
+    def _runPitInDocker(self, commit: str, target_classes: List[str], report_dir: Path) -> bool:
+        temp_root = self.reportsDir / "docker-temp" / commit
+        if temp_root.exists():
+            shutil.rmtree(temp_root)
+        temp_root.mkdir(parents=True, exist_ok=True)
 
-    def _runPitest(self, report_dir, target_classes: List[str], cwd=None, live_output=False, mutators: str = None):
-        """
-        Runs PITest using the short prefix (pom.xml has plugin configured)
-        """
-        print(f"    Running PITest on {len(target_classes)} classes...")
-        
-        base = f"mvn pitest:mutationCoverage -Dpitest.reportsDirectory={report_dir}"
-        
-        if target_classes:
+        try:
+            wt_dir = self.reportsDir / "tmp-wt" / commit
+            if wt_dir.exists():
+                shutil.rmtree(wt_dir)
+            code, out, err = self._runCommand(f'git worktree add --detach "{wt_dir}" {commit}', cwd=self.projectDir, live_output=DEBUG)
+            if code != 0:
+                print(f"Failed to create transient worktree: {err or out}")
+                return False
+
+            try:
+                # copy minimal files
+                for name in ["pom.xml", "src", "mvnw", ".mvn"]:
+                    src = wt_dir / name
+                    dest = temp_root / name
+                    if src.exists():
+                        if src.is_dir():
+                            try:
+                                copytree(src, dest, dirs_exist_ok=True)
+                            except TypeError:
+                                shutil.copytree(src, dest)
+                        else:
+                            copy2(src, dest)
+
+                pom_path = temp_root / "pom.xml"
+                if not pom_path.exists():
+                    print("pom.xml not found -> cannot run PIT")
+                    return False
+
+                # inject pitest plugin + junit5 plugin
+                ns = {"m": "http://maven.apache.org/POM/4.0.0"}
+                ET.register_namespace('', ns["m"])
+                tree = ET.parse(str(pom_path))
+                root = tree.getroot()
+                build = root.find("m:build", ns) or ET.SubElement(root, "{http://maven.apache.org/POM/4.0.0}build")
+                plugins = build.find("m:plugins", ns) or ET.SubElement(build, "{http://maven.apache.org/POM/4.0.0}plugins")
+                plugin_elem = None
+                for p in plugins.findall("m:plugin", ns):
+                    gid = p.find("m:groupId", ns)
+                    aid = p.find("m:artifactId", ns)
+                    if gid is not None and aid is not None and gid.text == "org.pitest" and aid.text == "pitest-maven":
+                        plugin_elem = p
+                        break
+                if plugin_elem is None:
+                    plugin_elem = ET.SubElement(plugins, "{http://maven.apache.org/POM/4.0.0}plugin")
+                    ET.SubElement(plugin_elem, "{http://maven.apache.org/POM/4.0.0}groupId").text = "org.pitest"
+                    ET.SubElement(plugin_elem, "{http://maven.apache.org/POM/4.0.0}artifactId").text = "pitest-maven"
+                    ET.SubElement(plugin_elem, "{http://maven.apache.org/POM/4.0.0}version").text = PIT_VERSION
+                deps = plugin_elem.find("m:dependencies", ns) or ET.SubElement(plugin_elem, "{http://maven.apache.org/POM/4.0.0}dependencies")
+                if not any(d.find("m:artifactId", ns).text == "pitest-junit5-plugin" for d in deps.findall("m:dependency", ns)):
+                    dep = ET.SubElement(deps, "{http://maven.apache.org/POM/4.0.0}dependency")
+                    ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}groupId").text = "org.pitest"
+                    ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}artifactId").text = "pitest-junit5-plugin"
+                    ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}version").text = PIT_JUNIT5_PLUGIN_VERSION
+                tree.write(str(pom_path), encoding="utf-8", xml_declaration=True)
+
+            finally:
+                try:
+                    self._runCommand(f'git worktree remove "{wt_dir}" --force', cwd=self.projectDir, live_output=DEBUG)
+                except Exception:
+                    pass
+                if wt_dir.exists():
+                    shutil.rmtree(wt_dir)
+
             classes_str = ",".join(target_classes)
-            base += f" -Dpitest.targetClasses='{classes_str}'"
-            
-            # Also specify corresponding test classes
-            test_classes = ",".join([f"{cls}Test" for cls in target_classes])
-            base += f" -Dpitest.targetTests='{test_classes}'"
+            tests_str = ",".join(".".join(fq.split(".")[:-1]) + ".*Test" if "." in fq else fq + "*Test" for fq in target_classes)
+            report_dir_abs = str(report_dir.resolve())
 
-        if mutators:
-            base += f" -Dpitest.mutators={mutators}"
+            try:
+                host_uid = os.getuid()
+                host_gid = os.getgid()
+            except Exception:
+                host_uid = host_gid = 1000
 
-        code, out, err = self._runCommand(base, cwd=cwd, live_output=live_output, timeout=1800)
-        
-        if code == 124:
-            print("ERROR: PITest timeout (30 minutes)")
-            return False
-        
-        if code != 0:
-            print("Error when running PITest:")
-            if err and DEBUG:
-                print(err[-500:])
-            return False
+            mvn_pre = 'mvn -B -Drat.skip=true -DskipITs=true test-compile'
+            mvn_pitest = (
+                'mvn -B org.pitest:pitest-maven:%s:mutationCoverage '
+                '-DtargetClasses="%s" -DtargetTests="%s" -DreportsDirectory="%s" '
+                '-DfailWhenNoMutations=false -DskipTests=false'
+            ) % (PIT_VERSION, classes_str, tests_str, "/reports")
 
-        index_exists = (Path(report_dir) / "index.html").exists()
-        return index_exists
+            docker_cmd = (
+                'docker run --rm '
+                '-v "%s:/project:rw" -v "%s:/reports:rw" -w /project '
+                'maven:3.9-eclipse-temurin-21 bash -lc "%s && %s && chown -R %d:%d /reports"'
+                % (str(temp_root.resolve()), report_dir_abs, mvn_pre, mvn_pitest, host_uid, host_gid)
+            )
+
+            if DEBUG: print("[DEBUG] Docker command:", docker_cmd)
+
+            code, out, err = self._runCommand(docker_cmd, cwd=temp_root, live_output=DEBUG, timeout=3600)
+            if code != 0:
+                print("Error when running PITest:")
+                if out: print("=== DOCKER STDOUT ===\n", out)
+                if err: print("=== DOCKER STDERR ===\n", err)
+                return False
+
+            exists = (Path(report_dir_abs) / "index.html").exists()
+            if not exists:
+                try:
+                    listing = "\n".join(p.name for p in Path(report_dir_abs).glob("*"))
+                    print(f"Report dir contents: {listing}")
+                except Exception:
+                    pass
+
+            return exists
+
+        finally:
+            try:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root)
+            except Exception as e:
+                print(f"Warning cleaning temp dir: {e}")
 
     def _printResults(self, results):
-        """
-        Prints the results of the analysis.
-        """
         print(f"\n{'='*70}")
         print("Analysis completed")
         print(f"{'='*70}")
@@ -309,20 +334,7 @@ class CommitAnalyzer:
 
         print(f"\nIndex saved in: {index_file}")
 
-    def _getCommitInfo(self, commit):
-        """
-            Gets the commit info. Used internally.
-        """
-        msg_code, msg, _ = self._runCommand(f"git log --format=%B -n 1 {commit}")
-        date_code, date, _ = self._runCommand(f"git log --format=%aI -n 1 {commit}")
-        msg = msg.strip().split('\n')[0] if msg_code == 0 else "N/A"
-        date = date.strip() if date_code == 0 else "N/A"
-        return {"message": msg, "date": date}
-
     def analyze(self):
-        """
-        Runs the incremental mutation analysis.
-        """
         print(f"\n{'='*70}")
         print("Incremental commit mutation analysis")
         print(f"{'='*70}")
@@ -360,30 +372,36 @@ class CommitAnalyzer:
                 if not file_rel.endswith('.java') or 'src/main/java' not in file_rel:
                     continue
                 
-                # Call MCParser to map lines to methods
                 mapped = self._mapLinesToMethods(file_rel, lines, cwd=self.projectDir)
                 
-                # DEBUG: Print what MCParser returned
-                if DEBUG:
-                    print(f"\n[DEBUG] MCParser output for {file_rel}:")
-                    print(f"  Affected: {mapped.get('affectedMethods', [])}")
-                    print(f"  Callers:  {mapped.get('callers', [])}")
-                    print(f"  Callees:  {mapped.get('callees', [])}")
-                
-                # Skip if no affected methods found (Javadoc/comments only)
                 if not mapped.get("affectedMethods"):
                     print(f"  No methods affected (Javadoc/comments?)")
                     continue
                 
-                cls = Path(file_rel).stem
-                changes[cls] = {
+                rel_path = file_rel
+                if "src/main/java/" in rel_path:
+                    fq = rel_path.split("src/main/java/", 1)[1].replace("/", ".").replace("\\", ".")
+                    if fq.endswith(".java"):
+                        fq = fq[:-5]
+                else:
+                    try:
+                        src_file = (self.projectDir / file_rel)
+                        text = src_file.read_text(encoding="utf-8")
+                        m = re.search(r'^\s*package\s+([a-zA-Z0-9_.]+)\s*;', text, re.MULTILINE)
+                        if m:
+                            fq = m.group(1) + "." + Path(file_rel).stem
+                        else:
+                            fq = Path(file_rel).stem
+                    except Exception:
+                        fq = Path(file_rel).stem
+
+                short_name = Path(file_rel).stem
+                changes[fq] = {
                     "affected": mapped.get("affectedMethods", []),
                     "callers": mapped.get("callers", []),
-                    "callees": mapped.get("callees", [])
+                    "callees": mapped.get("callees", []),
+                    "_short": short_name
                 }
-                print(f"  {len(mapped['affectedMethods'])} methods found")
-                print(f"  {len(mapped.get('callers', []))} callers found")
-                print(f"  {len(mapped.get('callees', []))} callees found")
 
             if not changes:
                 print("No actual methods affected (documentation only)\n")
@@ -394,31 +412,15 @@ class CommitAnalyzer:
 
             print("Classes to test:")
             for class_name, methods in changes.items():
-                affected_count = len(methods['affected'])
-                callers_count = len(methods['callers'])
-                callees_count = len(methods['callees'])
                 print(f"  {class_name}:")
-                print(f"    - Affected: {affected_count}")
-                print(f"    - Callers:  {callers_count}")
-                print(f"    - Callees:  {callees_count}")
+                print(f"    - Affected: {len(methods['affected'])}")
+                print(f"    - Callers:  {len(methods['callers'])}")
+                print(f"    - Callees:  {len(methods['callees'])}")
 
-            # Checkout commit
-            code, _, _ = self._runCommand(f"git checkout {commit}")
-            if code != 0:
-                print("Error checking out commit\n")
-                continue
-
-            # Compile project
-            if not self._compileProject(cwd=self.projectDir, live_output=DEBUG):
-                print("Error when compiling.\n")
-                self._runCommand(f"git checkout {self.currentBranch}")
-                continue
-
-            # Run PITest
             report_dir = self.reportsDir / f"{idx:02d}-{commit}"
             report_dir.mkdir(parents=True, exist_ok=True)
-
-            success = self._runPitest(str(report_dir), target_classes, cwd=self.projectDir, live_output=DEBUG)
+            
+            success = self._runPitInDocker(commit, target_classes, report_dir)
             
             if success:
                 print("PITest completed")
@@ -433,19 +435,8 @@ class CommitAnalyzer:
                 results.append(result)
                 with open(report_dir / "metadata.json", 'w', encoding='utf-8') as f:
                     json.dump(result, f, indent=2, ensure_ascii=False)
-                
-                # DEBUG: Print what was saved to metadata
-                if DEBUG: print(f"[DEBUG] Metadata saved with {len(changes)} classes")
-                for cls, data in changes.items():
-                    print(f"  {cls}: {len(data['affected'])} affected, {len(data['callers'])} callers, {len(data['callees'])} callees")
             else:
                 print("Error when running PITest.\n")
-
-            # Restore branch
-            self._runCommand(f"git checkout {self.currentBranch}")
-
-        print(f"\nRestoring branch {self.currentBranch}...")
-        self._runCommand(f"git checkout {self.currentBranch}")
 
         self._printResults(results)
         return True
