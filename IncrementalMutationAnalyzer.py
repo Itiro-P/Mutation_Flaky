@@ -8,8 +8,6 @@ import click
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-PIT_VER = "1.14.2"
-MAX_THREADS = 4
 DEBUG = True
 
 class CommitAnalyzer:
@@ -207,7 +205,7 @@ class CommitAnalyzer:
         lines_str = " ".join(f"-l {ln}" for ln in compressed)
         cmd = f"java -jar \"{self.mcParserPath}\" -f \"{target_file}\" {lines_str}"
         
-        print(f"[CMD] Lines compressed to: {compressed}")  # DEBUG
+        if DEBUG: print(f"[CMD] Lines compressed to: {compressed}")
         
         code, out, err = self._runCommand(cmd, cwd=cwd, live_output=DEBUG)
         
@@ -224,39 +222,62 @@ class CommitAnalyzer:
 
     def _compileProject(self, cwd=None, live_output=DEBUG):
         """
-            Compiles project in the current working directory (worktree)
+        Compiles project in the current working directory (worktree)
         """
         print(f"    Compiling... (cwd={cwd or self.projectDir})")
-        code, out, err = self._runCommand("mvn clean compile test-compile -DskipTests=true", cwd=cwd, live_output=DEBUG)
+        
+        # First time: clean compile
+        # After: only recompile changed files
+        cmd = "mvn compile test-compile -DskipTests=true"
+        
+        code, out, err = self._runCommand(cmd, cwd=cwd, live_output=live_output)
         if code != 0:
-            print("Erro na compilação:")
+            print("Error when compiling:")
             if out:
-                print(out)
+                print(out[-500:])
             if err:
-                print(err)
+                print(err[-500:])
+            # Retry with clean if failed
+            print("Retrying with clean...")
+            cmd = "mvn clean compile test-compile -DskipTests=true"
+            code, out, err = self._runCommand(cmd, cwd=cwd, live_output=live_output)
+            return code == 0
+        
         return code == 0
 
-    def _runPitest(self, report_dir, target_classes: List[str], cwd=None, live_output=DEBUG, mutators: str = None):
+    def _runPitest(self, report_dir, target_classes: List[str], cwd=None, live_output=False, mutators: str = None):
         """
-            Runs PITest. Used internally
+        Runs PITest using the short prefix (pom.xml has plugin configured)
         """
-        print(f"    Running PITest... (cwd={cwd or self.projectDir})")
+        print(f"    Running PITest on {len(target_classes)} classes...")
+        
+        base = f"mvn pitest:mutationCoverage -Dpitest.reportsDirectory={report_dir}"
+        
         if target_classes:
             classes_str = ",".join(target_classes)
-            base = f"mvn org.pitest:pitest-maven:{PIT_VER}:mutationCoverage -Dpitest.targetClasses='{classes_str}' -Dpitest.threads={MAX_THREADS} -Dpitest.outputFormats=HTML -Dpitest.reportsDirectory={report_dir}"
-        else:
-            base = f"mvn org.pitest:pitest-maven:{PIT_VER}:mutationCoverage -Dpitest.threads={MAX_THREADS} -Dpitest.outputFormats=HTML -Dpitest.reportsDirectory={report_dir}"
+            base += f" -Dpitest.targetClasses='{classes_str}'"
+            
+            # Also specify corresponding test classes
+            test_classes = ",".join([f"{cls}Test" for cls in target_classes])
+            base += f" -Dpitest.targetTests='{test_classes}'"
 
         if mutators:
             base += f" -Dpitest.mutators={mutators}"
 
-        code, out, err = self._runCommand(base, cwd=cwd, live_output=DEBUG)
+        code, out, err = self._runCommand(base, cwd=cwd, live_output=live_output, timeout=1800)
+        
+        if code == 124:
+            print("ERROR: PITest timeout (30 minutes)")
+            return False
+        
         if code != 0:
             print("Error when running PITest:")
-            if err:
-                print(err)
+            if err and DEBUG:
+                print(err[-500:])
+            return False
 
-        return code == 0
+        index_exists = (Path(report_dir) / "index.html").exists()
+        return index_exists
 
     def _printResults(self, results):
         """
@@ -414,7 +435,7 @@ class CommitAnalyzer:
                     json.dump(result, f, indent=2, ensure_ascii=False)
                 
                 # DEBUG: Print what was saved to metadata
-                print(f"[DEBUG] Metadata saved with {len(changes)} classes")
+                if DEBUG: print(f"[DEBUG] Metadata saved with {len(changes)} classes")
                 for cls, data in changes.items():
                     print(f"  {cls}: {len(data['affected'])} affected, {len(data['callers'])} callers, {len(data['callees'])} callees")
             else:

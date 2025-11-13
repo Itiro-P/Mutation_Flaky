@@ -72,11 +72,11 @@ public class MCParser {
                 System.err.println("[DEBUG-METHODS] Found method: " + className + "." + m.getNameAsString() + " [" + start + "-" + end + "]");
                 
                 if (isLineInRange(start, end)) {
-                    System.err.println("  IN RANGE - Added to affected");
+                    System.err.println("  ✓ IN RANGE - Added to affected");
                     methodMap.put(className + "." + m.getSignature(),
                             new MethodInfo(className, m.getNameAsString(), start, end));
                 } else {
-                    System.err.println("  OUT OF RANGE");
+                    System.err.println("  ✗ OUT OF RANGE");
                 }
             });
         });
@@ -97,60 +97,46 @@ public class MCParser {
     private void buildCallGraph(CompilationUnit cu) {
         Set<String> affected = methodMap.keySet();
         
-        System.err.println("[DEBUG] Affected methods: " + affected.size());
-        affected.forEach(m -> System.err.println("  - " + m));
+        if (affected.isEmpty()) {
+            System.err.println("[DEBUG] No affected methods, skipping call graph");
+            return;
+        }
+        
+        System.err.println("[DEBUG] Building call graph for " + affected.size() + " methods");
 
         // Find callees: Methods called by affected methods
         affected.forEach(affectedMethod -> {
-            cu.findAll(MethodDeclaration.class).forEach(m -> {
-                String methodKey = getMethodKey(m);
-                if (methodKey.equals(affectedMethod)) {
-                    System.err.println("[DEBUG] Found affected method implementation: " + methodKey);
-                    
-                    // This is one of our affected methods, find what it calls
+            cu.findAll(MethodDeclaration.class).stream()
+                .filter(m -> getMethodKey(m).equals(affectedMethod))
+                .findFirst()
+                .ifPresent(m -> {
                     List<com.github.javaparser.ast.expr.MethodCallExpr> calls = m.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class);
-                    System.err.println("  - Calls found in method: " + calls.size());
-                    
                     calls.forEach(call -> {
                         String calledName = call.getNameAsString();
-                        System.err.println("    - Calling: " + calledName);
-                        
-                        // Find which methods in allMethodsMap match this call
                         allMethodsMap.keySet().stream()
                             .filter(k -> k.endsWith("." + calledName))
                             .forEach(calledMethod -> {
-                                System.err.println("      - Matched in allMethodsMap: " + calledMethod);
                                 callGraph.putIfAbsent(affectedMethod, new HashSet<>()).add(calledMethod);
                             });
                     });
-                }
-            });
+                });
         });
 
         // Find callers: Methods that call affected methods
-        System.err.println("[DEBUG] Searching for callers...");
-        cu.findAll(MethodDeclaration.class).forEach(m -> {
-            String caller = getMethodKey(m);
-            
-            List<com.github.javaparser.ast.expr.MethodCallExpr> calls = m.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class);
-            calls.forEach(call -> {
-                String calledName = call.getNameAsString();
-                
-                // Check if any affected method is being called
-                List<String> matchedAffected = affected.stream()
-                    .filter(k -> k.endsWith("." + calledName))
-                    .collect(java.util.stream.Collectors.toList());
-                
-                if (!matchedAffected.isEmpty()) {
-                    System.err.println("[DEBUG] Caller found: " + caller + " calls " + calledName);
-                    matchedAffected.forEach(affectedMethod -> {
-                        reverseCallGraph.putIfAbsent(affectedMethod, new HashSet<>()).add(caller);
-                    });
-                }
-            });
+        List<MethodDeclaration> allMethods = cu.findAll(MethodDeclaration.class);
+        affected.forEach(affectedMethod -> {
+            allMethods.stream()
+                .filter(m -> {
+                    List<com.github.javaparser.ast.expr.MethodCallExpr> calls = m.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class);
+                    return calls.stream()
+                        .anyMatch(call -> affectedMethod.endsWith("." + call.getNameAsString()));
+                })
+                .forEach(caller -> {
+                    reverseCallGraph.putIfAbsent(affectedMethod, new HashSet<>()).add(getMethodKey(caller));
+                });
         });
         
-        System.err.println("[DEBUG] buildCallGraph done. Callers: " + reverseCallGraph.size() + ", Callees: " + callGraph.size());
+        System.err.println("[DEBUG] Call graph built. Callees: " + callGraph.size() + ", Callers: " + reverseCallGraph.size());
     }
 
     private String getMethodKey(MethodDeclaration m) {
