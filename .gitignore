@@ -89,4 +89,6 @@ nb-configuration.xml
 ##############################
 *.log
 
+*.jar
+
 /diff_analysis
