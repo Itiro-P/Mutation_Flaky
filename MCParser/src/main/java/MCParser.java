@@ -18,7 +18,6 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -103,17 +102,14 @@ public class MCParser {
 
         changedRanges = parseLineArgs(lineArgs);
 
-        // build solver and parser config BEFORE parsing
         CombinedTypeSolver typeSolver = buildTypeSolver(projectRoot, extraJars);
         JavaSymbolSolver symbolSolver = new JavaSymbolSolver(typeSolver);
         ParserConfiguration cfg = new ParserConfiguration().setSymbolResolver(symbolSolver);
         cfg.setLexicalPreservationEnabled(true);
         cfg.setStoreTokens(true);
 
-        // parse all files with symbol solver active (helps inner classes)
         parseAllJavaFilesParallel(projectRoot, cfg);
 
-        // index and resolve
         int threads = Math.max(1, Runtime.getRuntime().availableProcessors());
         buildAllMethodsMapWithResolution(projectRoot, threads);
         buildCallGraphWithResolution(threads);
@@ -121,95 +117,117 @@ public class MCParser {
         Map<String, Set<String>> classToMethods = new HashMap<>();
         for (MethodInfo mi : allMethods.values()) classToMethods.computeIfAbsent(mi.className, k -> new LinkedHashSet<>()).add(mi.simpleName);
 
-        // affected methods (MethodInfo objects)
         Set<MethodInfo> affectedMethods = allMethods.values().stream()
                 .filter(mi -> projectRoot.resolve(mi.sourceFile).normalize().equals(targetFile))
                 .filter(mi -> rangesOverlap(mi.startLine, mi.endLine, changedRanges))
                 .collect(Collectors.toCollection(LinkedHashSet::new));
 
-        Set<String> affectedMethodKeys = allMethods.values().stream()
-        .filter(mi -> projectRoot.resolve(mi.sourceFile).normalize().equals(targetFile))
-        .filter(mi -> rangesOverlap(mi.startLine, mi.endLine, changedRanges))
-        .filter(mi -> !isExternal(mi.className))
-        .map(mi -> mi.key)
-        .collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<String> affectedMethodKeys = affectedMethods.stream()
+                .map(mi -> mi.key).collect(Collectors.toCollection(LinkedHashSet::new));
 
-        // prepare result buckets
-        Set<String> affectedTests = new LinkedHashSet<>();
         Set<String> affectedClasses = new LinkedHashSet<>();
-
+        Set<String> tests = new LinkedHashSet<>();
         Set<String> callerClasses = new LinkedHashSet<>();
-        Set<String> callerMethods = new LinkedHashSet<>();
-        Set<String> callerTests = new LinkedHashSet<>();
-
         Set<String> calleeClasses = new LinkedHashSet<>();
-        Set<String> calleeMethods = new LinkedHashSet<>();
-        Set<String> calleeTests = new LinkedHashSet<>();
+
+        Set<String> callerMethodKeys = new LinkedHashSet<>();
+        Set<String> calleeMethodKeys = new LinkedHashSet<>();
 
         for (MethodInfo method : affectedMethods) {
             if(isExternal(method.className)) continue;
-            if (method.isTest) affectedTests.add(method.className);
-            else affectedClasses.add(method.className);
+            
+            if (method.isTest) {
+                tests.add(method.className);
+            } else {
+                affectedClasses.add(method.className);
+            }
 
-            // look up callers/callees by method key (not by class name)
             Set<String> callersOfThis = reverseCallGraph.getOrDefault(method.key, Collections.emptySet());
+            callerMethodKeys.addAll(callersOfThis);
+
             Set<String> calleesOfThis = callGraph.getOrDefault(method.key, Collections.emptySet());
-
-            callerMethods.addAll(callersOfThis);
-            calleeMethods.addAll(calleesOfThis);
+            calleeMethodKeys.addAll(calleesOfThis);
         }
 
-        // map method keys -> classes and tests
-        for (String mk : callerMethods) {
+        for (String mk : callerMethodKeys) {
             String cls = classFromMethodKey(mk);
-            if (isTest(cls)) callerTests.add(cls); else callerClasses.add(cls);
-        }
-        for (String mk : calleeMethods) {
-            String cls = classFromMethodKey(mk);
-            if (isTest(cls)) calleeTests.add(cls); else calleeClasses.add(cls);
+            if (isExternal(cls)) continue;
+
+            if (Boolean.TRUE.equals(testClassCache.get(cls))) {
+                boolean targetFileIsTest = affectedMethods.stream().anyMatch(mi -> mi.isTest);                
+                if (!targetFileIsTest) tests.add(cls);
+                
+            } else {
+                callerClasses.add(cls);
+            }
         }
 
-        // methodsToMutateGlobal should be sets of method KEYS
-        List<PitClassReport> affectedReports = buildReportsForClasses(
-                affectedClasses,
-                affectedMethodKeys,
-                affectedTests,
-                classToMethods
-        );
-        List<PitClassReport> callerReports = buildReportsForClasses(
-                callerClasses,
-                callerMethods,
-                callerTests,
-                classToMethods
-        );
-        List<PitClassReport> calleeReports = buildReportsForClasses(
-                calleeClasses,
-                calleeMethods,
-                calleeTests,
-                classToMethods
-        );
+        for (String mk : calleeMethodKeys) {
+            String cls = classFromMethodKey(mk);
+            if (isExternal(cls)) continue;
+
+            if (Boolean.TRUE.equals(testClassCache.get(cls))) {
+                boolean targetFileIsTest = affectedMethods.stream().anyMatch(mi -> mi.isTest);                
+                if (!targetFileIsTest) tests.add(cls);
+                
+            } else {
+                calleeClasses.add(cls);
+            }
+        }
+
+        Set<String> productionClasses = new HashSet<>();
+        productionClasses.addAll(affectedClasses);
+        productionClasses.addAll(callerClasses);
+        productionClasses.addAll(calleeClasses);
+        
+        Set<String> allKnownClasses = classToMethods.keySet(); 
+
+        for (String prodClass : productionClasses) {
+            Set<String> namesToTest = new HashSet<>();
+
+            String simpleName = prodClass.substring(prodClass.lastIndexOf('.') + 1);
+            namesToTest.add(simpleName);
+
+            String[] parts = prodClass.split("\\.");
+            if (parts.length > 1) {
+                String potentialParent = parts[parts.length - 2];
+                if (!potentialParent.isEmpty() && Character.isUpperCase(potentialParent.charAt(0))) {
+                    namesToTest.add(potentialParent);
+                }
+            }
+
+            for (String nameToMatch : namesToTest) {
+                for (String candidate : allKnownClasses) {
+                    // Só nos interessa se for classe de teste
+                    if (!Boolean.TRUE.equals(testClassCache.get(candidate))) continue;
+
+                    String candidateSimple = candidate.substring(candidate.lastIndexOf('.') + 1);
+                    if (candidateSimple.equals(nameToMatch + "Test") || 
+                        candidateSimple.equals(nameToMatch + "Tests") ||
+                        candidateSimple.equals("Test" + nameToMatch) ||
+                        candidateSimple.equals(nameToMatch + "IT")) {
+                        tests.add(candidate);
+                    }
+                }
+            }
+        }
+
+        List<ClassReport> affectedReports = buildReportsForClasses(affectedClasses, affectedMethodKeys, classToMethods);
+        List<ClassReport> callerReports = buildReportsForClasses(callerClasses, callerMethodKeys, classToMethods);
+        List<ClassReport> calleeReports = buildReportsForClasses(calleeClasses, calleeMethodKeys, classToMethods);
 
         Map<String,Object> out = new LinkedHashMap<>();
         if (includeFound) out.put("allMethods", allMethods.keySet());
         out.put("affectedClass", affectedReports);
         out.put("callerClass", callerReports);
         out.put("calleeClass", calleeReports);
+        out.put("tests", tests);
 
         System.out.println(GSON.toJson(out));
     }
 
-    private boolean isTest(String mi) {
-        if (mi == null) return false;
-        String lowerCase = mi.toLowerCase();
-        if (lowerCase.contains("test")) return true;
-        if (lowerCase.endsWith("it")) return true;
-        if (lowerCase.endsWith("spec")) return true;
-        if (lowerCase.endsWith("tests")) return true;
-        return false;
-    }
-
-    private List<PitClassReport> buildReportsForClasses(Set<String> classes, Set<String> methodsToMutateGlobal, Set<String> tests, Map<String, Set<String>> classToMethods) {
-        List<PitClassReport> reports = new ArrayList<>();
+    private List<ClassReport> buildReportsForClasses(Set<String> classes, Set<String> methodsToMutateGlobal, Map<String, Set<String>> classToMethods) {
+        List<ClassReport> reports = new ArrayList<>();
         for (String cls : classes) {
             Set<String> methodsToMutate = methodsToMutateGlobal.stream()
                     .filter(m -> cls.equals(classFromMethodKey(m)))
@@ -219,7 +237,7 @@ public class MCParser {
             Set<String> allInClass = classToMethods.getOrDefault(cls, Collections.emptySet());
             Set<String> methodsToExclude = new LinkedHashSet<>(allInClass);
             methodsToExclude.removeAll(methodsToMutate);
-            reports.add(new PitClassReport(cls, methodsToMutate, methodsToExclude, tests));
+            reports.add(new ClassReport(cls, methodsToMutate, methodsToExclude));
         }
         return reports;
     }
@@ -276,10 +294,37 @@ public class MCParser {
                     s.filter(p -> p.toString().endsWith(".jar")).forEach(j -> addJarToSolver(j, typeSolver)); 
                 } catch (IOException ignored) {}   
 
-        if (extraJars != null) for (String je : extraJars) if (je != null) for (String part : je.split(",")) { part = part.trim(); if (part.isEmpty()) continue; Path jpath = Paths.get(part); if (!jpath.isAbsolute()) jpath = projectRoot.resolve(jpath).normalize(); if (Files.exists(jpath) && jpath.toString().endsWith(".jar")) addJarToSolver(jpath, typeSolver); }
+        if (extraJars != null) 
+            for (String je : extraJars) 
+                if (je != null) 
+                    for (String part : je.split(",")) { 
+                        part = part.trim(); 
+                        if (part.isEmpty()) continue; 
+                        Path jpath = Paths.get(part); 
+                        if (!jpath.isAbsolute()) jpath = projectRoot.resolve(jpath).normalize(); 
+                        if (Files.exists(jpath) && jpath.toString().endsWith(".jar")) addJarToSolver(jpath, typeSolver); 
+                    }
 
         Path pom = projectRoot.resolve("pom.xml");
-        if (Files.exists(pom)) try { javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance(); javax.xml.parsers.DocumentBuilder db = dbf.newDocumentBuilder(); org.w3c.dom.Document doc = db.parse(pom.toFile()); org.w3c.dom.NodeList deps = doc.getElementsByTagName("dependency"); Path m2 = Paths.get(System.getProperty("user.home"), ".m2", "repository"); for (int i=0;i<deps.getLength();i++) { org.w3c.dom.Node n = deps.item(i); if (n.getNodeType()!=org.w3c.dom.Node.ELEMENT_NODE) continue; org.w3c.dom.Element e = (org.w3c.dom.Element) n; String gid = getChildText(e, "groupId"); String aid = getChildText(e, "artifactId"); String ver = getChildText(e, "version"); if (gid==null||aid==null||ver==null) continue; Path jarPath = m2.resolve(gid.replace('.', File.separatorChar)).resolve(aid).resolve(ver).resolve(aid + "-" + ver + ".jar"); if (Files.exists(jarPath)) addJarToSolver(jarPath, typeSolver); } } catch (Exception ex) { err("Warning: failed to parse pom.xml: " + ex.getMessage()); }
+        if (Files.exists(pom)) 
+            try { 
+                javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance(); 
+                javax.xml.parsers.DocumentBuilder db = dbf.newDocumentBuilder(); 
+                org.w3c.dom.Document doc = db.parse(pom.toFile()); 
+                org.w3c.dom.NodeList deps = doc.getElementsByTagName("dependency"); 
+                Path m2 = Paths.get(System.getProperty("user.home"), ".m2", "repository"); 
+                for (int i=0;i<deps.getLength();i++) { 
+                    org.w3c.dom.Node n = deps.item(i); 
+                    if (n.getNodeType()!=org.w3c.dom.Node.ELEMENT_NODE) continue; 
+                    org.w3c.dom.Element e = (org.w3c.dom.Element) n; 
+                    String gid = getChildText(e, "groupId"); 
+                    String aid = getChildText(e, "artifactId"); 
+                    String ver = getChildText(e, "version"); 
+                    if (gid==null||aid==null||ver==null) continue; 
+                    Path jarPath = m2.resolve(gid.replace('.', File.separatorChar)).resolve(aid).resolve(ver).resolve(aid + "-" + ver + ".jar"); 
+                    if (Files.exists(jarPath)) addJarToSolver(jarPath, typeSolver); 
+                } 
+            } catch (Exception ex) { err("Warning: failed to parse pom.xml: " + ex.getMessage()); }
 
         return typeSolver;
     }
@@ -349,13 +394,6 @@ public class MCParser {
                         ResolvedMethodDeclaration rmd = m.resolve();
                         String resolvedSig = safeQualifiedSignature(rmd);
                         String fqClass = miClassName(rmd);
-                        
-                        String simple = m.getNameAsString();
-                        if (simple.equals("toComparator")) {
-                            int s = m.getBegin().map(p -> p.line).orElse(-1);
-                            int e = m.getEnd().map(p -> p.line).orElse(-1);
-                            err("[SECOND_PASS] toComparator resolved [" + s + "-" + e + "] sig=" + resolvedSig);
-                        }
                         
                         // Se conseguiu resolver melhor, atualizar entrada
                         if (!isExternal(fqClass) && !resolvedSig.equals(fallbackKey)) {
@@ -548,9 +586,7 @@ public class MCParser {
         for (Map.Entry<Integer,Integer> e: changedRanges.entrySet()) { 
             int s=e.getKey(), en=e.getValue(); 
 
-            if (s <= end && en >= start) {
-                return true;
-            }
+            if (s <= end && en >= start) return true;
         } 
         
         return false;
@@ -612,17 +648,15 @@ public class MCParser {
         } 
     }
 
-    private static class PitClassReport { 
+    private static class ClassReport {
         String className; 
         Set<String> methodsToMutate; 
         Set<String> methodsToExclude; 
-        Set<String> testClasses; 
-        PitClassReport(String className, Set<String> methodsToMutate, Set<String> methodsToExclude, Set<String> testClasses) { 
+        ClassReport(String className, Set<String> methodsToMutate, Set<String> methodsToExclude) { 
             this.className=className; 
             this.methodsToMutate=methodsToMutate; 
-            this.methodsToExclude=methodsToExclude; 
-            this.testClasses=testClasses; 
-        } 
+            this.methodsToExclude=methodsToExclude;  
+        }
     }
 
     private String classFromMethodKey(String methodKey) { 
@@ -673,7 +707,13 @@ public class MCParser {
     private boolean isTestAnnotation(AnnotationExpr ann) {
         String name = ann.getName().getIdentifier();
         if (TEST_ANNOT_SIMPLE.contains(name)) return true;
-        try { ResolvedAnnotationDeclaration rad = ann.resolve(); String q = rad.getQualifiedName(); for (String prefix : TEST_ANNOT_PKG_PREFIX) if (q.startsWith(prefix)) return true; if (q.toLowerCase().contains(".test")) return true; } catch (Throwable e) { /* ignore resolution failure */ }
+        try { 
+            ResolvedAnnotationDeclaration rad = ann.resolve(); 
+            String q = rad.getQualifiedName(); 
+            for (String prefix : TEST_ANNOT_PKG_PREFIX) 
+                if (q.startsWith(prefix)) return true; 
+                if (q.toLowerCase().contains(".test")) return true; 
+        } catch (Throwable e) { /* ignore resolution failure */ }
         return false;
     }
 }

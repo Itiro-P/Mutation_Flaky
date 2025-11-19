@@ -21,7 +21,7 @@ DUMMY_RETURN = {
 }
 
 PIT_VERSION = "1.14.2"
-PIT_JUNIT5_PLUGIN_VERSION = "1.2.1"
+PIT_JUNIT5_PLUGIN_VERSION = "1.2.0"
 DOCKER_IMG = "maven:3.9-eclipse-temurin-21"
 MUTATORS_LIST = [
     "MATH",
@@ -206,9 +206,6 @@ class CommitAnalyzer:
                 return {}
 
         line_args = " ".join(f"-l {ln}" for ln in compressed)
-        if line_args == "-l 213 -l 223" and file_path[file_path.rfind("/"):] == "/FileAlterationObserver.java":
-            print("alterandooo")
-            line_args = "-l 221 -l 226"
         cmd = f'java -jar "{self.mcParserPath}" -p "{cwd}" -f "{target_file}" {line_args}'
 
         if DEBUG:
@@ -228,35 +225,62 @@ class CommitAnalyzer:
             print(f"Failed to parse MCParser JSON: {e}")
             return {}
 
-    def _runPitInDocker(self, commit: str, target_classes: List[str], test_classes: List[str], exclude_methods: List[str], report_dir: Path):
+    def _runPitInDocker(self, commit: str, target_classes: List[str], test_classes: List[str],
+                        exclude_methods: List[str], report_dir: Path, worktree_dir: Path = None):
         worktree_timer_start = time.perf_counter()
 
+        # temp_root is the directory that will be mounted into the container (we copy minimal files into it)
         temp_root = self.reportsDir / "docker-temp" / commit
         if temp_root.exists():
-            shutil.rmtree(temp_root)
+            try:
+                shutil.rmtree(temp_root)
+            except Exception:
+                pass
         temp_root.mkdir(parents=True, exist_ok=True)
 
-        wt_dir = self.reportsDir / "tmp-wt" / commit
-        if wt_dir.exists():
-            shutil.rmtree(wt_dir)
-        code, out, err = self._runCommand(f'git worktree add --detach "{wt_dir}" {commit}', cwd=self.projectDir, live_output=DEBUG)
-        if code != 0:
-            print(f"Failed to create transient worktree: {err or out}")
-            return DUMMY_RETURN
+        # If caller supplied a worktree_dir, use it as the source to copy from (we won't modify it).
+        # Otherwise, create our own transient worktree and mark that we must remove it later.
+        created_local_worktree = False
+        source_root = None
+        if worktree_dir is not None:
+            source_root = worktree_dir
+        else:
+            created_local_worktree = True
+            wt_dir = self.reportsDir / "tmp-wt" / commit
+            if wt_dir.exists():
+                try:
+                    shutil.rmtree(wt_dir)
+                except Exception:
+                    pass
+            code, out, err = self._runCommand(f'git worktree add --detach "{wt_dir}" {commit}', cwd=self.projectDir, live_output=DEBUG)
+            if code != 0:
+                print(f"Failed to create transient worktree: {err or out}")
+                return DUMMY_RETURN
+            source_root = wt_dir
 
         try:
-            # copy minimal files
+            # copy minimal files from source_root into temp_root (pom.xml, src, mvnw, .mvn)
             for name in ["pom.xml", "src", "mvnw", ".mvn"]:
-                src = wt_dir / name
+                src = Path(source_root) / name
                 dest = temp_root / name
                 if src.exists():
-                    if src.is_dir():
-                        try:
+                    try:
+                        if src.is_dir():
                             copytree(src, dest, dirs_exist_ok=True)
-                        except TypeError:
+                        else:
+                            copy2(src, dest)
+                    except TypeError:
+                        # fallback for older python where dirs_exist_ok doesn't exist
+                        try:
                             shutil.copytree(src, dest)
-                    else:
-                        copy2(src, dest)
+                        except Exception:
+                            # best-effort: copy file if file
+                            if src.is_file():
+                                copy2(src, dest)
+                    except Exception as e:
+                        # best-effort: ignore copy errors but warn
+                        if DEBUG:
+                            print(f"Warning copying {src} -> {dest}: {e}")
 
             pom_path = temp_root / "pom.xml"
             if not pom_path.exists():
@@ -264,25 +288,25 @@ class CommitAnalyzer:
                 return DUMMY_RETURN
 
             ns = {"m": "http://maven.apache.org/POM/4.0.0"}
-            
+
             ET.register_namespace('', ns["m"])
 
             tree = ET.parse(str(pom_path))
             root = tree.getroot()
-            
+
             build = root.find("m:build", ns)
             if build is None:
-                build = ET.SubElement(root, "{http://maven.apache.org/POM/4.0.0}build")
-            
+                build = ET.SubElement(root, "{http://maven.org/POM/4.0.0}build")
+
             plugins = build.find("m:plugins", ns)
             if plugins is None:
-                plugins = ET.SubElement(build, "{http://maven.apache.org/POM/4.0.0}plugins")
+                plugins = ET.SubElement(build, "{http://maven.org/POM/4.0.0}plugins")
 
             plugin_elem = None
             for p in plugins.findall("m:plugin", ns):
                 gid = p.find("m:groupId", ns)
                 aid = p.find("m:artifactId", ns)
-                if (gid is not None and aid is not None and 
+                if (gid is not None and aid is not None and
                     gid.text == "org.pitest" and aid.text == "pitest-maven"):
                     plugin_elem = p
                     break
@@ -298,156 +322,204 @@ class CommitAnalyzer:
                 deps = ET.SubElement(plugin_elem, "{http://maven.apache.org/POM/4.0.0}dependencies")
 
             has_junit5 = any(
-                d.find("m:artifactId", ns) is not None and 
+                d.find("m:artifactId", ns) is not None and
                 d.find("m:artifactId", ns).text == "pitest-junit5-plugin"
                 for d in deps.findall("m:dependency", ns)
             )
-            
+
             if not has_junit5:
                 dep = ET.SubElement(deps, "{http://maven.apache.org/POM/4.0.0}dependency")
                 ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}groupId").text = "org.pitest"
                 ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}artifactId").text = "pitest-junit5-plugin"
                 ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}version").text = PIT_JUNIT5_PLUGIN_VERSION
-            
 
+            # write modified POM into temp_root
             xml_str = ET.tostring(root, encoding='unicode')
-            
             xml_str = xml_str.replace('<m:project', '<project')
             xml_str = xml_str.replace('</m:project>', '</project>')
-            
+
             with open(str(pom_path), 'w', encoding='utf-8') as f:
                 f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
                 f.write(xml_str)
-            
-        finally:
-            try:
-                self._runCommand(f'git worktree remove "{wt_dir}" --force', cwd=self.projectDir, live_output=DEBUG)
-            except Exception:
-                pass
-            if wt_dir.exists():
-                shutil.rmtree(wt_dir)
 
-        worktree_elapsed_time = time.perf_counter() - worktree_timer_start
+            worktree_elapsed_time = time.perf_counter() - worktree_timer_start
 
-        classes_str = ",".join(target_classes)
-        tests_str = ",".join(test_classes)
-        report_dir_abs = str(report_dir.resolve())
-        exclude_methods_str = ",".join(exclude_methods)
+            classes_str = ",".join(target_classes)
+            tests_str = ",".join(test_classes)
+            report_dir_abs = str(report_dir.resolve())
+            exclude_methods_str = ",".join(exclude_methods)
 
-        docker_workdir = "-w /project"
+            m2_path = Path.home() / ".m2"
+            vol_m2 = f'-v "{m2_path}:/root/.m2:rw"' if m2_path.exists() else ""
 
-        container_name = f"pit_{commit}"
+            vol_project = f'-v "{str(temp_root.resolve())}:/project:rw"'
+            vol_reports = f'-v "{report_dir_abs}:/reports:rw"'
+            container_name = f"pit_{commit}"
 
-        docker_vol_project = f'-v "{str(temp_root.resolve())}:/project:rw"'
-        docker_vol_reports = f'-v "{report_dir_abs}:/reports:rw"'
-        docker_workdir = "-w /project"
+            # Maven commands
+            mvn_pre = 'mvn -B -q -Drat.skip=true -DskipITs=true test-compile'
+            mvn_pitest = (
+                f"mvn -B org.pitest:pitest-maven:{PIT_VERSION}:mutationCoverage "
+                f"-DtargetClasses={classes_str} "
+                f"-DreportsDirectory=/reports "
+                f"-Dmutators={MUTATORS} "
+                f"-DtargetTests={tests_str} "
+                f"-Dthreads=8 "
+                f"-DexcludeMethods={exclude_methods_str} "
+                f"-DfailWhenNoMutations=false -DskipTests=false -DoutputFormats=CSV"
+            )
 
-        # Maven commands
-        mvn_pre = 'mvn -B -q -Drat.skip=true -DskipITs=true test-compile'
-        mvn_pitest = (
-            f"mvn -B org.pitest:pitest-maven:{PIT_VERSION}:mutationCoverage "
-            f"-DtargetClasses={classes_str} "
-            f"-DreportsDirectory=/reports "
-            f"-Dmutators={MUTATORS} "
-            f"-DtargetTests={tests_str} "
-            f"-DexcludeMethods={exclude_methods_str} "
-            f"-DfailWhenNoMutations=false -DskipTests=false -DoutputFormats=CSV"
-        )
+            docker_cleanup = "rm -rf /project/* /project/.[!.]* /project/..?*"
 
-        docker_cleanup = "rm -rf /project/* /project/.[!.]* /project/..?*"
+            cmd_create = (
+                f'docker create --name {container_name} '
+                f'{vol_project} {vol_reports} {vol_m2} -w /project '
+                f'{DOCKER_IMG} tail -f /dev/null'
+            )
+            print(f"\n[DEBUG] Creating container: {cmd_create}")
+            docker_setup_timer_start = time.perf_counter()
+            c_code, c_out, c_err = self._runCommand(cmd_create, live_output=DEBUG)
+            if c_code != 0:
+                print("ERROR creating docker container")
+                print(c_out, c_err)
+                return DUMMY_RETURN
 
-        cmd_create = (
-            f'docker create --name {container_name} '
-            f'{docker_vol_project} {docker_vol_reports} {docker_workdir} '
-            f'{DOCKER_IMG} tail -f /dev/null'
-        )
+            cmd_start = f"docker start {container_name}"
+            print(f"[DEBUG] Starting container: {cmd_start}")
+            s_code, s_out, s_err = self._runCommand(cmd_start, live_output=DEBUG)
+            if s_code != 0:
+                print("ERROR starting docker container")
+                print(s_out, s_err)
+                # cleanup created worktree if we created one here
+                if created_local_worktree:
+                    try:
+                        self._runCommand(f'git worktree remove "{source_root}" --force', cwd=self.projectDir, live_output=DEBUG)
+                    except Exception:
+                        pass
+                    if source_root.exists():
+                        try:
+                            shutil.rmtree(source_root)
+                        except Exception:
+                            pass
+                self._runCommand(f"docker rm -f {container_name}")
+                return DUMMY_RETURN
+            docker_setup_elapsed_time = time.perf_counter() - docker_setup_timer_start
 
-        print(f"\n[DEBUG] Creating container: {cmd_create}")
-        docker_setup_timer_start = time.perf_counter()
-        c_code, c_out, c_err = self._runCommand(cmd_create, live_output=DEBUG)
-        if c_code != 0:
-            print("ERROR creating docker container")
-            print(c_out, c_err)
-            return DUMMY_RETURN
+            mvn_pre_timer_start = time.perf_counter()
+            cmd_pre = f'docker exec {container_name} bash -lc "{mvn_pre}"'
+            print("\n[DEBUG] Running mvn precompile:")
+            pre_code, pre_out, pre_err = self._runCommand(cmd_pre, live_output=DEBUG)
 
-        cmd_start = f"docker start {container_name}"
-        print(f"[DEBUG] Starting container: {cmd_start}")
-        s_code, s_out, s_err = self._runCommand(cmd_start, live_output=DEBUG)
-        if s_code != 0:
-            print("ERROR starting docker container")
-            print(s_out, s_err)
-            self._runCommand(f"docker rm -f {container_name}")
-            return DUMMY_RETURN
-        docker_setup_elapsed_time = time.perf_counter() - docker_setup_timer_start
-        mvn_pre_timer_start = time.perf_counter()
+            if pre_code != 0:
+                print("\nERROR in mvn precompile")
+                print(pre_out, pre_err)
+                self._runCommand(f"docker rm -f {container_name}")
+                # cleanup created worktree if we created one here
+                if created_local_worktree:
+                    try:
+                        self._runCommand(f'git worktree remove "{source_root}" --force', cwd=self.projectDir, live_output=DEBUG)
+                    except Exception:
+                        pass
+                    if source_root.exists():
+                        try:
+                            shutil.rmtree(source_root)
+                        except Exception:
+                            pass
+                return DUMMY_RETURN
 
-        cmd_pre = f'docker exec {container_name} bash -lc "{mvn_pre}"'
-        print("\n[DEBUG] Running mvn precompile:")
-        pre_code, pre_out, pre_err = self._runCommand(cmd_pre, live_output=DEBUG)
+            mvp_pre_time_elapsed = time.perf_counter() - mvn_pre_timer_start
+            pit_timer_start = time.perf_counter()
 
-        if pre_code != 0:
-            print("\nERROR in mvn precompile")
-            print(pre_out, pre_err)
-            self._runCommand(f"docker rm -f {container_name}")
-            return DUMMY_RETURN
-        
-        mvp_pre_time_elapsed = time.perf_counter() - mvn_pre_timer_start
-        pit_timer_start = time.perf_counter()
+            cmd_pitest = f'docker exec {container_name} bash -lc "{mvn_pitest}"'
+            print("\n[DEBUG] Running PITest:")
+            print(f"[DEBUG] Command: {cmd_pitest}\n")
+            pit_code, pit_out, pit_err = self._runCommand(cmd_pitest, live_output=True)
 
-        cmd_pitest = f'docker exec {container_name} bash -lc "{mvn_pitest}"'
-        print("\n[DEBUG] Running PITest:")
-        print(f"[DEBUG] Command: {cmd_pitest}\n")  # ← DEBUG: mostrar comando exato
-        pit_code, pit_out, pit_err = self._runCommand(cmd_pitest, live_output=True)
+            if pit_code != 0:
+                print("\nERROR running PITest")
+                print(pit_out, pit_err)
+                self._runCommand(f"docker rm -f {container_name}")
+                # cleanup created worktree if we created one here
+                if created_local_worktree:
+                    try:
+                        self._runCommand(f'git worktree remove "{source_root}" --force', cwd=self.projectDir, live_output=DEBUG)
+                    except Exception:
+                        pass
+                    if source_root.exists():
+                        try:
+                            shutil.rmtree(source_root)
+                        except Exception:
+                            pass
+                return DUMMY_RETURN
 
-        if pit_code != 0:
-            print("\nERROR running PITest")
-            print(pit_out, pit_err)
-            self._runCommand(f"docker rm -f {container_name}")
-            return DUMMY_RETURN
-        
-        pit_elapsed_time = time.perf_counter() - pit_timer_start
+            pit_elapsed_time = time.perf_counter() - pit_timer_start
 
-        if DEBUG: print("\n[DEBUG] Verificando arquivos gerados no container...")
-        cmd_list = f'docker exec {container_name} ls -lah /reports/'
-        list_code, list_out, list_err = self._runCommand(cmd_list, live_output=DEBUG)
-        if list_code == 0: print(f"Files in /reports:\n{list_out}")
-        
-        docker_cleanup_timer_start = time.perf_counter()
+            if DEBUG: 
+                print("\n[DEBUG] Verificando arquivos gerados no container...")
+                cmd_list = f'docker exec {container_name} ls -lah /reports/'
+                list_code, list_out, list_err = self._runCommand(cmd_list, live_output=DEBUG)
+                if list_code == 0: print(f"Files in /reports:\n{list_out}")
 
-        cmd_clean = f'docker exec {container_name} bash -lc "{docker_cleanup}"'
-        print("\n[DEBUG] Cleaning project dir inside container:")
-        clean_code, clean_out, clean_err = self._runCommand(cmd_clean, live_output=DEBUG)
+            docker_cleanup_timer_start = time.perf_counter()
+            cmd_clean = f'docker exec {container_name} bash -lc "{docker_cleanup}"'
+            print("\n[DEBUG] Cleaning project dir inside container:")
+            clean_code, clean_out, clean_err = self._runCommand(cmd_clean, live_output=DEBUG)
 
-        if clean_code != 0:
-            print("\nERROR cleaning container workspace")
-            print(clean_out, clean_err)
-            self._runCommand(f"docker rm -f {container_name}")
-            return DUMMY_RETURN
+            if clean_code != 0:
+                print("\nERROR cleaning container workspace")
+                print(clean_out, clean_err)
+                self._runCommand(f"docker rm -f {container_name}")
+                # cleanup created worktree if we created one here
+                if created_local_worktree:
+                    try:
+                        self._runCommand(f'git worktree remove "{source_root}" --force', cwd=self.projectDir, live_output=DEBUG)
+                    except Exception:
+                        pass
+                    if source_root.exists():
+                        try:
+                            shutil.rmtree(source_root)
+                        except Exception:
+                            pass
+                return DUMMY_RETURN
 
-        print(f"\n[DEBUG] Removing container {container_name}")
-        rm_code, rm_out, rm_err = self._runCommand(f"docker rm -f {container_name}", live_output=DEBUG)
+            print(f"\n[DEBUG] Removing container {container_name}")
+            rm_code, rm_out, rm_err = self._runCommand(f"docker rm -f {container_name}", live_output=DEBUG)
 
-        if rm_code != 0:
-            print("\nWARNING: could not remove container")
-            print(rm_out, rm_err)
+            if rm_code != 0:
+                print("\nWARNING: could not remove container")
+                print(rm_out, rm_err)
 
-        docker_cleanup_elapsed_time = time.perf_counter() - docker_cleanup_timer_start
+            docker_cleanup_elapsed_time = time.perf_counter() - docker_cleanup_timer_start
 
-        exists = (Path(report_dir_abs) / "mutations.csv").exists()
-        
-        if not exists:
-            listing = "\n".join(p.name for p in Path(report_dir_abs).glob("*"))
-            print(f"Report dir ({report_dir_abs}) contents:\n{listing}")
-            print(f"\nPITest output:\n{pit_out}")
-            if pit_err:
-                print(f"\nPITest errors:\n{pit_err}")
+            exists = (Path(report_dir_abs) / "mutations.csv").exists()
 
-        return {
-            "exists": exists,
-            "setup_time": worktree_elapsed_time + docker_setup_elapsed_time + mvp_pre_time_elapsed,
-            "pit_time": pit_elapsed_time,
-            "cleanup_time": docker_cleanup_elapsed_time
-        }
+            if not exists:
+                listing = "\n".join(p.name for p in Path(report_dir_abs).glob("*"))
+                print(f"Report dir ({report_dir_abs}) contents:\n{listing}")
+                print(f"\nPITest output:\n{pit_out}")
+                if pit_err:
+                    print(f"\nPITest errors:\n{pit_err}")
+
+            # cleanup created local worktree if any
+            if created_local_worktree:
+                try:
+                    self._runCommand(f'git worktree remove "{source_root}" --force', cwd=self.projectDir, live_output=DEBUG)
+                except Exception:
+                    pass
+                if source_root.exists():
+                    try:
+                        shutil.rmtree(source_root)
+                    except Exception:
+                        pass
+
+            return {
+                "exists": exists,
+                "setup_time": worktree_elapsed_time + docker_setup_elapsed_time + mvp_pre_time_elapsed,
+                "pit_time": pit_elapsed_time,
+                "cleanup_time": docker_cleanup_elapsed_time
+            }
+        except Exception as e:
+            print(f"Error when running PIT: {e}")
 
     def _printResults(self, results):
         print(f"\n{'='*70}")
@@ -547,115 +619,145 @@ class CommitAnalyzer:
                 print("No altered lines detected\n")
                 continue
 
-            all_parsed = []
-            analysis_timer_start = time.perf_counter()
-            
-            for file_rel, lines in changed_lines.items():
-                if not file_rel.endswith('.java'):
-                    continue
-
-                parsed = self._mapLinesToMethods(file_rel, lines, cwd=self.projectDir)
-                if not parsed:
-                    print(f"  No MCParser output for {file_rel}")
-                    continue
-
-                all_parsed.append(parsed)
-
-            if not all_parsed:
-                print("No actual methods affected (documentation only?)\n")
+            # create transient worktree for this commit so MCParser sees the exact snapshot
+            wt_dir = self.reportsDir / "tmp-wt" / commit
+            if wt_dir.exists():
+                try:
+                    shutil.rmtree(wt_dir)
+                except Exception:
+                    pass
+            code, out, err = self._runCommand(f'git worktree add --detach "{wt_dir}" {commit}', cwd=self.projectDir, live_output=DEBUG)
+            if code != 0:
+                print(f"Failed to create transient worktree for commit {commit}: {err or out}")
+                # fallback: skip this commit
                 continue
 
-            all_test_classes = set()
-            all_exclude_methods = set()
-            target_classes = set()
+            try:
+                all_parsed = []
+                analysis_timer_start = time.perf_counter()
 
-            for parsed in all_parsed:
-                # affectedClass
-                for ac in parsed.get("affectedClass", []):
-                    class_name = ac.get("className")
-                    if not class_name:
+                # parse changed files using the worktree as cwd so MCParser reads that commit state
+                for file_rel, lines in changed_lines.items():
+                    if not file_rel.endswith('.java'):
                         continue
-                    
-                    methods_to_mutate = ac.get("methodsToMutate", []) or []
-                    if methods_to_mutate:
-                        target_classes.add(class_name)
-                    
-                    all_test_classes.update(ac.get("testClasses", []))
-                    all_exclude_methods.update(ac.get("methodsToExclude", []))
 
-                # callerClass
-                for cc in parsed.get("callerClass", []):
-                    class_name = cc.get("className")
-                    if not class_name:
+                    parsed = self._mapLinesToMethods(file_rel, lines, cwd=wt_dir)
+                    if not parsed:
+                        print(f"  No MCParser output for {file_rel}")
                         continue
-                    
-                    methods_to_mutate = cc.get("methodsToMutate", []) or []
-                    if methods_to_mutate:
-                        target_classes.add(class_name)
-                    
-                    all_test_classes.update(cc.get("testClasses", []))
-                    all_exclude_methods.update(cc.get("methodsToExclude", []))
 
-                # calleeClass
-                for ce in parsed.get("calleeClass", []):
-                    class_name = ce.get("className")
-                    if not class_name:
-                        continue
-                    
-                    methods_to_mutate = ce.get("methodsToMutate", []) or []
-                    if methods_to_mutate:
-                        target_classes.add(class_name)
-                    
-                    all_test_classes.update(ce.get("testClasses", []))
-                    all_exclude_methods.update(ce.get("methodsToExclude", []))
+                    all_parsed.append(parsed)
 
-            target_classes = target_classes - all_test_classes
-            
-            target_classes = {cls for cls in target_classes if not self.is_test_class(cls)}
+                if not all_parsed:
+                    print("No actual methods affected (documentation only?)\n")
+                    continue
 
-            if not target_classes:
-                print("Nothing to mutate(?)\n")
-                continue
+                all_test_classes = set()
+                all_exclude_methods = set()
+                target_classes = set()
 
-            target_classes = sorted(target_classes)
-            all_test_classes = sorted(all_test_classes)
-            all_exclude_methods = sorted(set(all_exclude_methods))
+                for parsed in all_parsed:
+                    for test in parsed.get("tests", []):
+                        all_test_classes.add(test)
 
-            print(f"\nTarget classes to mutate: {len(target_classes)}")
-            for cls in target_classes:
-                print(f"  - {cls}")
+                    # affectedClass
+                    for ac in parsed.get("affectedClass", []):
+                        class_name = ac.get("className")
+                        if not class_name:
+                            continue
 
-            if DEBUG:
-                print("\n[DEBUG] target_classes =", target_classes)
-                print("[DEBUG] test_classes =", all_test_classes)
-                print("[DEBUG] exclude_methods =", all_exclude_methods)
+                        methods_to_mutate = ac.get("methodsToMutate", []) or []
+                        if methods_to_mutate:
+                            target_classes.add(class_name)
 
-            analysis_elapsed_time = time.perf_counter() - analysis_timer_start
-            report_dir = self.reportsDir / f"{idx:02d}-{commit}"
-            report_dir.mkdir(parents=True, exist_ok=True)
+                        all_exclude_methods.update(ac.get("methodsToExclude", []))
 
-            success = self._runPitInDocker(commit, target_classes, all_test_classes, all_exclude_methods, report_dir)
+                    # callerClass
+                    for cc in parsed.get("callerClass", []):
+                        class_name = cc.get("className")
+                        if not class_name:
+                            continue
 
-            if success["exists"]:
-                print("PITest completed")
-                print(f"Report: {report_dir}/mutations.csv\n")
-                result = {
-                    "index": idx,
-                    "commit": commit,
-                    "info": info,
-                    "time_elapsed": {
-                        "setup_time": analysis_elapsed_time + success["setup_time"],
-                        "pit_time": success["pit_time"],
-                        "cleanup_time": success["cleanup_time"]
-                    },
-                    "report_dir": str(report_dir)
-                }
-                results.append(result)
-                with open(report_dir / "metadata.json", 'w', encoding='utf-8') as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
-            else:
-                print("Error when running PITest. Commit analysis directory removed\n")
-                shutil.rmtree(report_dir)
+                        methods_to_mutate = cc.get("methodsToMutate", []) or []
+                        if (methods_to_mutate):
+                            target_classes.add(class_name)
+
+                        all_exclude_methods.update(cc.get("methodsToExclude", []))
+
+                    # calleeClass
+                    for ce in parsed.get("calleeClass", []):
+                        class_name = ce.get("className")
+                        if not class_name:
+                            continue
+
+                        methods_to_mutate = ce.get("methodsToMutate", []) or []
+                        if methods_to_mutate:
+                            target_classes.add(class_name)
+
+                        all_exclude_methods.update(ce.get("methodsToExclude", []))
+
+                # remove test classes from targets (we want production classes to mutate)
+                target_classes = target_classes - all_test_classes
+
+                # filter out classes that look like tests by simple suffix rule
+                target_classes = {cls for cls in target_classes if not self.is_test_class(cls)}
+
+                if not target_classes:
+                    print("Nothing to mutate(?)\n")
+                    continue
+
+                target_classes = sorted(target_classes)
+                all_test_classes = sorted(all_test_classes)
+                all_exclude_methods = sorted(set(all_exclude_methods))
+
+                print(f"\nTarget classes to mutate: {len(target_classes)}")
+                for cls in target_classes:
+                    print(f"  - {cls}")
+
+                if DEBUG:
+                    print("\n[DEBUG] target_classes =", target_classes)
+                    print("[DEBUG] test_classes =", all_test_classes)
+                    print("[DEBUG] exclude_methods =", all_exclude_methods)
+
+                analysis_elapsed_time = time.perf_counter() - analysis_timer_start
+                report_dir = self.reportsDir / f"{idx:02d}-{commit}"
+                report_dir.mkdir(parents=True, exist_ok=True)
+
+                # run PIT reusing the worktree we just created (so PIT runs the same snapshot)
+                success = self._runPitInDocker(commit, target_classes, all_test_classes, all_exclude_methods, report_dir, worktree_dir=wt_dir)
+
+                if success["exists"]:
+                    print("PITest completed")
+                    print(f"Report: {report_dir}/mutations.csv\n")
+                    result = {
+                        "index": idx,
+                        "commit": commit,
+                        "info": info,
+                        "time_elapsed": {
+                            "setup_time": analysis_elapsed_time + success["setup_time"],
+                            "pit_time": success["pit_time"],
+                            "cleanup_time": success["cleanup_time"]
+                        },
+                        "report_dir": str(report_dir)
+                    }
+                    results.append(result)
+                    with open(report_dir / "metadata.json", 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
+                else:
+                    print("Error when running PITest. Commit analysis directory removed\n")
+                    shutil.rmtree(report_dir)
+
+            finally:
+                # remove the transient worktree created for MCParser (caller is owner of this worktree)
+                try:
+                    self._runCommand(f'git worktree remove "{wt_dir}" --force', cwd=self.projectDir, live_output=DEBUG)
+                except Exception:
+                    pass
+                if wt_dir.exists():
+                    try:
+                        shutil.rmtree(wt_dir)
+                    except Exception:
+                        pass
 
         self._printResults(results)
         return True

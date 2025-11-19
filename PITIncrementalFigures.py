@@ -124,9 +124,6 @@ class ReportLoader:
         try:
             print(f"Procurando em: {self.reports_path}\n")
             
-            # Verificar se diretórios de commit estão diretamente aqui
-            # Estrutura: reports_path/01-{hash}/, reports_path/03-{hash}/, etc
-            
             def extract_index(dirname: str) -> int:
                 """Extrai o índice do nome do diretório"""
                 parts = dirname.split('-')
@@ -212,42 +209,130 @@ class ReportLoader:
         df.to_csv(output_path, index=False)
         print(f"\nResumo consolidado salvo em: {output_path}")
     
-    def generate_graphs(self, output_dir: Path):
+
+    def load_baseline_mutations(self) -> float:
+        """
+        Carrega o mutations.csv do diretório raiz e calcula a taxa de kill do baseline.
+        Retorna a taxa de kill (float) ou 0.0 em caso de erro.
+        """
+        baseline_path = self.reports_path / "mutations.csv" 
+        
+        # Se for executado diretamente na raiz, o baseline deve estar na raiz.
+        if not baseline_path.exists():
+             baseline_path = Path("mutations.csv").resolve()
+
+        if not baseline_path.exists():
+            print(f"\nAviso: mutations.csv de Baseline não encontrado. Procurado em: {self.reports_path.parent / 'mutations.csv'} e {Path('mutations.csv').resolve()}")
+            return 0.0
+        
+        print(f"\nCarregando Baseline de: {baseline_path}")
+        
+        # Cria um objeto Commit temporário
+        baseline_commit = Commit(0, 'baseline')
+        
+        # Reutiliza o carregador de CSV e o calculador de resumo
+        if baseline_commit.load_mutations_csv(baseline_path):
+            summary = baseline_commit.get_summary()
+            taxa_kill = summary.get('taxa_kill', 0.0)
+            print(f"  Baseline Taxa de Kill: {taxa_kill:.2f}%")
+            return taxa_kill
+        
+        return 0.0
+
+    def generate_graphs(self, output_dir: Path, baseline_kill_rate: float, baseline_time: float):
         """Gerar gráficos"""
         if not self.commits:
             print("Nenhum commit para gerar gráficos")
             return
         
-        df = self.get_all_summaries()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        WINDOW_SIZE = 3 # Tamanho da janela de suavização
+
+        tempos = {
+            'setup_time': [],
+            'pit_time': [], # ESTA É A MÉTRICA QUE QUEREMOS
+            'cleanup_time': [],
+            'index': []
+        }
         
-        # Gráfico 1: Taxa de kill
-        plt.figure(figsize=(12, 6))
-        plt.plot(df['index'], df['taxa_kill'], marker='o', linewidth=2)
-        plt.xlabel('Commit')
-        plt.ylabel('Taxa de Kill (%)')
-        plt.grid(True, alpha=0.3)
+        # Coleta de dados de tempo (necessário para o Gráfico 03 e para a Média)
+        for commit in self.commits:
+            time_elapsed = commit.metadata.get('time_elapsed', {})
+            tempos['setup_time'].append(time_elapsed.get('setup_time', 0))
+            tempos['pit_time'].append(time_elapsed.get('pit_time', 0))
+            tempos['cleanup_time'].append(time_elapsed.get('cleanup_time', 0))
+            tempos['index'].append(commit.index)
+
+        df = self.get_all_summaries()
+        df_time = pd.DataFrame(tempos).set_index('index')
+        df_time_smoothed = df_time.rolling(window=WINDOW_SIZE, min_periods=1).mean().bfill()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        historical_mean_kill_rate = df['taxa_kill'].mean() if not df.empty else 0.0
+        historical_mean_time = df_time['pit_time'].mean() if not df_time.empty else 0.0
+        
+        # Calcular a média móvel (rolling mean) para as métricas principais
+        df['taxa_kill_smoothed'] = df['taxa_kill'].rolling(window=WINDOW_SIZE, min_periods=1).mean().bfill()
+        df['killed_smoothed'] = df['killed'].rolling(window=WINDOW_SIZE, min_periods=1).mean().bfill()
+        df['survived_smoothed'] = df['survived'].rolling(window=WINDOW_SIZE, min_periods=1).mean().bfill()
+        df['total_mutacoes_smoothed'] = df['total_mutacoes'].rolling(window=WINDOW_SIZE, min_periods=1).mean().bfill()
+
+        # Gráfico 1: Taxa de kill 
+        plt.figure(figsize=(14, 7))
+
+        if baseline_kill_rate > 0.0:
+            plt.axhline(
+                    y=baseline_kill_rate, 
+                    color='red', 
+                    linestyle='--', 
+                    linewidth=2, 
+                    label=f'Baseline ({baseline_kill_rate:.1f}%)'
+                )
+        
+        # Plotar a área preenchida
+        plt.fill_between(df['index'], df['taxa_kill_smoothed'], color='darkblue', alpha=0.3)
+        # Plotar a linha da média móvel (com marcador para destacar os commits)
+        plt.plot(df['index'], df['taxa_kill_smoothed'], marker='o', linewidth=3, label=f'Média Móvel ({WINDOW_SIZE})', color='darkblue', markersize=6) 
+        
+        # Linha Original (para contexto da dispersão)
+        plt.plot(df['index'], df['taxa_kill'], color='gray', alpha=0.2, linestyle='--', label='Original') 
+        
+        plt.title('Score de Mutação por Commit', fontsize=18)
+        plt.xlabel('Commit', fontsize=14)
+        plt.ylabel('Score de Mutação (%)', fontsize=14)
+        plt.legend(fontsize=12)
+        plt.grid(True, alpha=0.6, linestyle='--')
+        plt.ylim(0, 105) 
         plt.tight_layout()
         plt.savefig(output_dir / '01_taxa_kill.png', dpi=300)
         plt.close()
         print(f"Gráfico salvo: 01_taxa_kill.png")
         
-        # Gráfico 2: Distribuição de status
-        plt.figure(figsize=(12, 6))
-        plt.plot(df['index'], df['killed'], marker='o', label='Killed', linewidth=2, markersize=8)
-        plt.plot(df['index'], df['survived'], marker='s', label='Survived', linewidth=2, markersize=8)
-        #plt.plot(df['index'], df['no_coverage'], marker='^', label='No Coverage', linewidth=2, markersize=8)
-        plt.xlabel('Commit')
-        plt.ylabel('Quantidade de Mutações')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        # Gráfico 2: Distribuição de status (Gráfico de Área Empilhada Suavizada)
+        plt.figure(figsize=(14, 7))
+        
+        # Plotar áreas empilhadas (KILLED e SURVIVED)
+        plt.stackplot(
+            df['index'], 
+            df['killed_smoothed'], 
+            df['survived_smoothed'],
+            labels=['Morto (KILLED)', 'Vivo (SURVIVED)'],
+            colors=['green', 'red'],
+            alpha=0.6
+        )
+        
+        df['total_testable_smoothed'] = df['killed_smoothed'] + df['survived_smoothed']
+        # Adicionar a linha de Total
+        plt.plot(df['index'], df['total_testable_smoothed'], color='black', linestyle='--', linewidth=1.5, label='Total Testável (Suavizado)')
+        
+        plt.title('Distribuição de Mutações KILLED vs SURVIVED', fontsize=18)
+        plt.xlabel('Commit', fontsize=14)
+        plt.ylabel('Quantidade de Mutações', fontsize=14)
+        plt.legend(loc='upper left', fontsize=12)
+        plt.grid(True, axis='y', alpha=0.6, linestyle='--')
         plt.tight_layout()
         plt.savefig(output_dir / '02_distribuicao.png', dpi=300)
         plt.close()
         print(f"Gráfico salvo: 02_distribuicao.png")
         
-        # Gráfico 3: Tempo de execução (setup, pit, cleanup)
-        # Extrair tempos da metadata
         tempos = {
             'setup_time': [],
             'pit_time': [],
@@ -262,35 +347,106 @@ class ReportLoader:
             tempos['cleanup_time'].append(time_elapsed.get('cleanup_time', 0))
             tempos['index'].append(commit.index)
         
-        if tempos['index']:  # Se tem dados de tempo
+        df_time = pd.DataFrame(tempos).set_index('index')
+        df_time_smoothed = df_time.rolling(window=WINDOW_SIZE, min_periods=1).mean().bfill()
+        
+        if tempos['index']:
             plt.figure(figsize=(12, 6))
-            x = tempos['index']
-            plt.plot(x, tempos['setup_time'], marker='o', label='Setup Time', linewidth=2, markersize=8)
-            plt.plot(x, tempos['pit_time'], marker='s', label='PITest Time', linewidth=2, markersize=8)
-            #plt.plot(x, tempos['cleanup_time'], marker='^', label='Cleanup Time', linewidth=2, markersize=8)
+            x = df_time_smoothed.index.values
+
+            plt.plot(x, df_time_smoothed['setup_time'], label='Tempo de Configuração', linewidth=3, color='#4CAF50')
+            plt.plot(x, df_time_smoothed['pit_time'], label='Tempo de Execução do PITest', linewidth=3, color='#2196F3')
+            #plt.plot(x, df_time_smoothed['cleanup_time'], label='Tempo de Limpeza', linewidth=3, color='#FF9800')
+            
+            plt.title('Tempo de Execução', fontsize=16)
             plt.xlabel('Commit')
             plt.ylabel('Tempo (segundos)')
             plt.legend()
-            plt.grid(True, alpha=0.3)
+            plt.grid(True, alpha=0.5, linestyle='--')
             plt.tight_layout()
             plt.savefig(output_dir / '03_tempo_execucao.png', dpi=300)
             plt.close()
             print(f"Gráfico salvo: 03_tempo_execucao.png")
         
-        # Gráfico 4: Total de mutações
-        plt.figure(figsize=(12, 6))
-        plt.plot(df['index'], df['total_mutacoes'], marker='o', linewidth=2, markersize=8, color='purple')
-        plt.xlabel('Commit')
-        plt.ylabel('Total de Mutações')
-        plt.grid(True, alpha=0.3)
+        # Gráfico 4: Total de mutações (Gráfico de Área Suavizada)
+        plt.figure(figsize=(14, 7))
+
+        plt.fill_between(df['index'], df['total_mutacoes_smoothed'], color='purple', alpha=0.3)
+        # Plotar a linha da média móvel (com marcador)
+        plt.plot(df['index'], df['total_mutacoes_smoothed'], marker='o', linewidth=3, markersize=6, color='purple', label=f'Média Móvel ({WINDOW_SIZE})')
+
+        plt.plot(df['index'], df['total_mutacoes'], color='gray', alpha=0.2, linestyle='--', label='Original')
+        
+        plt.title('Total de Mutações Geradas por Commit', fontsize=18)
+        plt.xlabel('Commit', fontsize=14)
+        plt.ylabel('Total de Mutações', fontsize=14)
+        plt.legend(fontsize=12)
+        plt.grid(True, alpha=0.6, linestyle='--')
         plt.tight_layout()
         plt.savefig(output_dir / '04_total_mutacoes.png', dpi=300)
         plt.close()
         print(f"Gráfico salvo: 04_total_mutacoes.png")
 
+
+        if baseline_kill_rate > 0 or historical_mean_kill_rate > 0:
+            plt.figure(figsize=(8, 7))
+            
+            labels = ['Baseline', 'Média Histórica dos Commits']
+            scores = [baseline_kill_rate, historical_mean_kill_rate]
+            colors = ['red', 'darkblue']
+            
+            # Criar o gráfico de barras
+            bars = plt.bar(labels, scores, color=colors, width=0.6)
+            
+            # Adicionar o valor exato em cima de cada barra
+            for bar in bars:
+                yval = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2, yval + 1, f'{yval:.1f}%', ha='center', va='bottom', fontsize=12, fontweight='bold')
+            
+            # Estética
+            plt.title('Comparação do score de mutação: Média Histórica vs. Baseline', fontsize=16)
+            plt.ylabel('Score de Mutação (%)', fontsize=14)
+            plt.ylim(0, 105) # Limite máximo em 105%
+            plt.grid(True, axis='y', alpha=0.6, linestyle='--') # Grid só no eixo Y
+            plt.tight_layout()
+            
+            plt.savefig(output_dir / '05_comparacao_media_baseline.png', dpi=300)
+            plt.close()
+            print(f"Gráfico salvo: 05_comparacao_media_baseline.png")
+
+        if baseline_time > 0 or historical_mean_time > 0:
+                plt.figure(figsize=(8, 7))
+                
+                baseline_time_minutes = baseline_time / 60
+                historical_mean_time_minutes = historical_mean_time / 60
+                
+                labels = ['Baseline', 'Média Histórica dos Commits']
+                scores = [baseline_time_minutes, historical_mean_time_minutes]
+                colors = ['red', 'blue']
+
+                # Criar o gráfico de barras
+                bars = plt.bar(labels, scores, color=colors, width=0.6)
+                
+                # Adicionar o valor exato em cima de cada barra
+                for bar in bars:
+                    yval = bar.get_height()
+                    plt.text(bar.get_x() + bar.get_width()/2, yval + yval*0.02, f'{yval:.1f}m', ha='center', va='bottom', fontsize=12, fontweight='bold')
+                
+                # Estética
+                plt.title('Comparação de Tempo de Execução: Média Histórica vs. Baseline', fontsize=16)
+                plt.ylabel('Tempo de PITest (minutos)', fontsize=14)
+                plt.ylim(0, max(scores)*1.15 if max(scores) > 0 else 10) # Ajusta o Y para caber o label
+                plt.grid(True, axis='y', alpha=0.6, linestyle='--')
+                plt.tight_layout()
+                
+                plt.savefig(output_dir / '06_comparacao_tempo_baseline.png', dpi=300)
+                plt.close()
+                print(f"Gráfico salvo: 06_comparacao_tempo_baseline.png")
+
 @click.command()
 @click.option('-p', '--path', default='.', help='Caminho do diretório de relatórios.')
-def main(path: str):
+@click.option('-bt', '--baseline_time', type=float, default=0.0, help='Tempo de execução (em segundos) do PITest no Baseline.')
+def main(path: str, baseline_time: float):
     """Carregar e analisar relatórios PITest"""
     
     try:
@@ -309,13 +465,15 @@ def main(path: str):
         
         # Criar loader
         loader = ReportLoader(path_obj)
+
+        baseline_kill_rate = loader.load_baseline_mutations() 
         
         # Carregar todos os relatórios
         if not loader.load_all_reports():
             print("Nenhum relatório encontrado")
             sys.exit(1)
         
-        print(f"\n✓ {len(loader.commits)} commits carregados\n")
+        print(f"\n {len(loader.commits)} commits carregados\n")
         
         # Mostrar resumo
         df_summary = loader.get_all_summaries()
@@ -327,12 +485,11 @@ def main(path: str):
         # Salvar CSV consolidado
         csv_output = path_obj.parent / 'resumo_consolidado.csv'
         loader.save_consolidated_csv(csv_output)
-        
-        # Gerar gráficos
+
         graphs_dir = path_obj.parent / 'graficos'
-        loader.generate_graphs(graphs_dir)
+        loader.generate_graphs(graphs_dir, baseline_kill_rate, baseline_time)
         
-        print(f"\n✓ Análise concluída!")
+        print(f"\n Análise concluída!")
         sys.exit(0)
     
     except Exception as e:
