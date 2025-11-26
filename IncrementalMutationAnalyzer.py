@@ -333,6 +333,34 @@ class CommitAnalyzer:
                 ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}artifactId").text = "pitest-junit5-plugin"
                 ET.SubElement(dep, "{http://maven.apache.org/POM/4.0.0}version").text = PIT_JUNIT5_PLUGIN_VERSION
 
+            configuration = plugin_elem.find("m:configuration", ns)
+            if configuration is None:
+                configuration = ET.SubElement(plugin_elem, "{http://maven.apache.org/POM/4.0.0}configuration")
+
+
+            old_jvm_args = configuration.find("m:jvmArgs", ns)
+            if old_jvm_args is not None:
+                configuration.remove(old_jvm_args)
+
+            jvm_args = ET.SubElement(configuration, "{http://maven.apache.org/POM/4.0.0}jvmArgs")
+            
+            args_list = [
+                "-Xmx2048m",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED",
+                "--add-opens=java.base/java.util=ALL-UNNAMED",
+                "--add-opens=java.base/java.io=ALL-UNNAMED",
+                "-Djava.security.manager=allow"
+            ]
+
+            for arg in args_list:
+                arg_elem = ET.SubElement(jvm_args, "{http://maven.apache.org/POM/4.0.0}jvmArg")
+                arg_elem.text = arg
+
+            verbose_tag = configuration.find("m:verbose", ns)
+            if verbose_tag is not None:
+                configuration.remove(verbose_tag)
+            ET.SubElement(configuration, "{http://maven.apache.org/POM/4.0.0}verbose").text = "true"
+
             # write modified POM into temp_root
             xml_str = ET.tostring(root, encoding='unicode')
             xml_str = xml_str.replace('<m:project', '<project')
@@ -359,14 +387,14 @@ class CommitAnalyzer:
             # Maven commands
             mvn_pre = 'mvn -B -q -Drat.skip=true -DskipITs=true test-compile'
             mvn_pitest = (
-                f"mvn -B org.pitest:pitest-maven:{PIT_VERSION}:mutationCoverage "
+                f"mvn org.pitest:pitest-maven:{PIT_VERSION}:mutationCoverage "
                 f"-DtargetClasses={classes_str} "
                 f"-DreportsDirectory=/reports "
                 f"-Dmutators={MUTATORS} "
                 f"-DtargetTests={tests_str} "
                 f"-Dthreads=8 "
                 f"-DexcludeMethods={exclude_methods_str} "
-                f"-DfailWhenNoMutations=false -DskipTests=false -DoutputFormats=CSV"
+                f"-DfailWhenNoMutations=false -DskipTests=false -DoutputFormats=CSV "
             )
 
             docker_cleanup = "rm -rf /project/* /project/.[!.]* /project/..?*"
@@ -430,7 +458,7 @@ class CommitAnalyzer:
             mvp_pre_time_elapsed = time.perf_counter() - mvn_pre_timer_start
             pit_timer_start = time.perf_counter()
 
-            cmd_pitest = f'docker exec {container_name} bash -lc "{mvn_pitest}"'
+            cmd_pitest = f"docker exec {container_name} bash -lc '{mvn_pitest}'"
             print("\n[DEBUG] Running PITest:")
             print(f"[DEBUG] Command: {cmd_pitest}\n")
             pit_code, pit_out, pit_err = self._runCommand(cmd_pitest, live_output=True)

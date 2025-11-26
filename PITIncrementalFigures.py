@@ -321,7 +321,7 @@ class ReportLoader:
         
         df['total_testable_smoothed'] = df['killed_smoothed'] + df['survived_smoothed']
         # Adicionar a linha de Total
-        plt.plot(df['index'], df['total_testable_smoothed'], color='black', linestyle='--', linewidth=1.5, label='Total Testável (Suavizado)')
+        plt.plot(df['index'], df['total_testable_smoothed'], color='black', linestyle='--', linewidth=1.5, label='Total Testável')
         
         plt.title('Distribuição de Mutações KILLED vs SURVIVED', fontsize=18)
         plt.xlabel('Commit', fontsize=14)
@@ -448,7 +448,6 @@ class ReportLoader:
 @click.option('-bt', '--baseline_time', type=float, default=0.0, help='Tempo de execução (em segundos) do PITest no Baseline.')
 def main(path: str, baseline_time: float):
     """Carregar e analisar relatórios PITest"""
-    
     try:
         path_obj = Path(path).resolve()
         
