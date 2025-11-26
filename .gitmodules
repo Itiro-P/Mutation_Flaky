@@ -1,6 +1,6 @@
-[submodule "common-io"]
-	path = common-io
-	url = https://github.com/Itiro-P/commons-io.git
 [submodule "common-collections"]
 	path = common-collections
 	url = https://github.com/Itiro-P/commons-collections.git
+[submodule "common-cli"]
+	path = common-cli
+	url = https://github.com/Itiro-P/commons-cli.git
