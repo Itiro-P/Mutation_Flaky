@@ -1,0 +1,3 @@
+[submodule "astor-flakyrepair"]
+	path = astor-flakyrepair
+	url = git@github.com:Itiro-P/astor-flakyrepair.git
